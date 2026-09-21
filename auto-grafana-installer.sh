@@ -29,6 +29,8 @@ NVIDIA_EXPORTER_PORT=9836   # 9835 collided with a docker-proxy container on one
 
 # Dashboards to import are looked up in the same folder as this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Fallback: if a dashboard JSON isn't next to the script, download it from the repo
+DASHBOARD_REPO_RAW="https://raw.githubusercontent.com/vaibhav-dev19/grafana-setup-native/main"
 # -------------------------------------------------------------
 
 echo "============================================================"
@@ -598,15 +600,23 @@ fi
 # ------------------------------------------------------------------
 import_dashboard() {
     local label="$1"; shift
-    local file="" pattern payload result url
+    local file="" pattern payload result url downloaded=0
 
     for pattern in "$@"; do
         file=$(find "$SCRIPT_DIR" -maxdepth 1 -type f -iname "$pattern" | head -1)
         [ -n "$file" ] && break
     done
     if [ -z "$file" ]; then
-        echo "    ⏭️  ${label}: JSON not found in ${SCRIPT_DIR} (looked for: $*) — skipping"
-        return 0
+        # not local — try the GitHub repo (first pattern is the exact file name)
+        file=$(mktemp --suffix=.json)
+        if curl -fsSL -o "$file" "${DASHBOARD_REPO_RAW}/${1// /%20}"; then
+            downloaded=1
+            echo "    ⬇️  ${label}: not found locally, downloaded from GitHub repo"
+        else
+            rm -f "$file"
+            echo "    ⏭️  ${label}: JSON not found in ${SCRIPT_DIR} and download failed (looked for: $*) — skipping"
+            return 0
+        fi
     fi
 
     if ! payload=$(DASH_FILE="$file" DS_UID="$DS_UID" FOLDER_UID="$FOLDER_UID" python3 << 'PYEOF'
@@ -642,8 +652,10 @@ print(body)
 PYEOF
     ); then
         echo "    ⚠️  ${label}: could not parse ${file} (invalid JSON?) — skipping"
+        [ "$downloaded" = "1" ] && rm -f "$file"
         return 0
     fi
+    [ "$downloaded" = "1" ] && rm -f "$file"
 
     result=$(curl -s -X POST "${API}/api/dashboards/import" -u "$AUTH" \
       -H "Content-Type: application/json" -d "$payload")
