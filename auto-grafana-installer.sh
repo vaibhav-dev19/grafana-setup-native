@@ -473,7 +473,7 @@ RAM_PAYLOAD=$(build_rule "high_ram_usage" "High RAM Usage Alert" \
 create_or_update_rule "high_ram_usage" "$RAM_PAYLOAD"
 
 DISK_PAYLOAD=$(build_rule "high_disk_usage" "High Disk Usage Alert" \
-  "round(((node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"} - node_filesystem_free_bytes{fstype!~\"tmpfs|overlay\"}) / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"} * 100) * on(instance) group_left(nodename) node_uname_info, 0.01)" \
+  "round(((node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|squashfs|vfat|fuse.*\"} - node_filesystem_free_bytes{fstype!~\"tmpfs|overlay|squashfs|vfat|fuse.*\"}) / (node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|squashfs|vfat|fuse.*\"} > 0) * 100) * on(instance) group_left(nodename) node_uname_info, 0.01)" \
   "$DISK_THRESHOLD" "1m" \
   "🚨 High Disk Usage Detected" \
   "Disk usage is {{ printf \"%.2f\" \$values.B.Value }}% on {{ \$labels.nodename }} ({{ \$labels.instance }})."$'\n'"${ALERT_FOOTER}" \
