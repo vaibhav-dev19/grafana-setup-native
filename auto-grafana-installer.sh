@@ -26,6 +26,9 @@ PROMETHEUS_PORT=9091   # 9090 already in use on this host
 NODE_EXPORTER_PORT=9100
 CADVISOR_PORT=8081       # 8080 already in use on this host
 NVIDIA_EXPORTER_PORT=9836   # 9835 collided with a docker-proxy container on one host
+
+# Dashboards to import are looked up in the same folder as this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # -------------------------------------------------------------
 
 echo "============================================================"
@@ -387,6 +390,7 @@ create_or_update_rule() {
 build_rule() {
     RULE_UID="$1" RULE_TITLE="$2" RULE_EXPR="$3" RULE_THRESHOLD="$4" \
     RULE_FOR="$5" RULE_SUMMARY="$6" RULE_DESCRIPTION="$7" RULE_LABELS="$8" \
+    RULE_OP="${9:-gt}" RULE_NODATA="${10:-NoData}" \
     RULE_FOLDER_UID="$FOLDER_UID" RULE_DS_UID="$DS_UID" \
     python3 << 'PYEOF'
 import json, os
@@ -401,6 +405,8 @@ description = os.environ["RULE_DESCRIPTION"]
 labels = json.loads(os.environ["RULE_LABELS"])
 folder_uid = os.environ["RULE_FOLDER_UID"]
 ds_uid = os.environ["RULE_DS_UID"]
+op = os.environ.get("RULE_OP", "gt")            # gt = above threshold, lt = below
+no_data = os.environ.get("RULE_NODATA", "NoData")
 
 rule = {
     "uid": uid,
@@ -428,7 +434,7 @@ rule = {
             "model": {
                 "type": "threshold", "refId": "C", "expression": "B",
                 "conditions": [{
-                    "evaluator": {"params": [threshold], "type": "gt"},
+                    "evaluator": {"params": [threshold], "type": op},
                     "operator": {"type": "and"},
                     "query": {"params": ["C"]},
                     "reducer": {"params": [], "type": "last"},
@@ -437,7 +443,7 @@ rule = {
             }
         }
     ],
-    "noDataState": "NoData",
+    "noDataState": no_data,
     "execErrState": "Alerting",
     "for": for_duration,
     "annotations": {"summary": summary, "description": description},
@@ -489,9 +495,19 @@ else
     echo "    ⏭️  Skipping High GPU Usage Alert — no nvidia_gpu_exporter installed on this host"
 fi
 
-# System Down 
-#use query: up{job="node_exporter"}
-#Add a Reduce/Expression threshold condition.Set the trigger condition to Is Below 1 (or equals 0).Configure the pending period (e.g., 1m to 5m to prevent false positives from brief network blips)
+# System Down — query: up{job="node_exporter"}, condition: Is Below 1,
+# pending period 2m (avoids false positives from brief network blips).
+# No node_uname_info join here: if the host is down that series goes stale
+# and the join would silently drop the very alert we want. If the series
+# disappears entirely we also treat "no data" as down.
+DOWN_PAYLOAD=$(build_rule "system_down" "System Down Alert" \
+  'up{job="node_exporter"}' \
+  "1" "2m" \
+  "🚨 System Down" \
+  "node_exporter on {{ \$labels.instance }} is not responding — the system may be down."$'\n'"${ALERT_FOOTER}" \
+  '{"severity":"critical","alert_type":"down","team":"infrastructure"}' \
+  "lt" "Alerting")
+create_or_update_rule "system_down" "$DOWN_PAYLOAD"
 
 echo ""
 echo "    Rules created via API with X-Disable-Provenance — fully editable from the Grafana UI."
@@ -572,6 +588,79 @@ else
     echo "    $DASH_RESULT"
 fi
 
+# ------------------------------------------------------------------
+# Import custom dashboards (JSON files sitting next to this script)
+#   1. cadvisor dashboard.json
+#   2. Node Exporter Full.json
+# Handles both "export for sharing externally" files (__inputs /
+# ${DS_PROMETHEUS}) and plain exports. Re-running overwrites in place.
+# ------------------------------------------------------------------
+import_dashboard() {
+    local label="$1"; shift
+    local file="" pattern payload result url
+
+    for pattern in "$@"; do
+        file=$(find "$SCRIPT_DIR" -maxdepth 1 -type f -iname "$pattern" | head -1)
+        [ -n "$file" ] && break
+    done
+    if [ -z "$file" ]; then
+        echo "    ⏭️  ${label}: JSON not found in ${SCRIPT_DIR} (looked for: $*) — skipping"
+        return 0
+    fi
+
+    if ! payload=$(DASH_FILE="$file" DS_UID="$DS_UID" FOLDER_UID="$FOLDER_UID" python3 << 'PYEOF'
+import json, os
+
+with open(os.environ["DASH_FILE"], encoding="utf-8") as f:
+    d = json.load(f)
+
+# Some exports are wrapped as {"dashboard": {...}}
+if isinstance(d.get("dashboard"), dict):
+    d = d["dashboard"]
+
+ds_uid = os.environ["DS_UID"]
+
+inputs = []
+for i in d.get("__inputs", []):
+    if i.get("type") == "datasource":
+        inputs.append({"name": i["name"], "type": "datasource",
+                       "pluginId": i.get("pluginId", "prometheus"), "value": ds_uid})
+    else:
+        inputs.append({"name": i["name"], "type": i.get("type", "constant"),
+                       "value": i.get("value", "")})
+
+d["id"] = None
+body = json.dumps({"dashboard": d, "overwrite": True, "inputs": inputs,
+                   "folderUid": os.environ["FOLDER_UID"]})
+
+# Plain export that still references ${DS_PROMETHEUS}: point it at our datasource
+if not inputs:
+    body = body.replace("${DS_PROMETHEUS}", ds_uid)
+
+print(body)
+PYEOF
+    ); then
+        echo "    ⚠️  ${label}: could not parse ${file} (invalid JSON?) — skipping"
+        return 0
+    fi
+
+    result=$(curl -s -X POST "${API}/api/dashboards/import" -u "$AUTH" \
+      -H "Content-Type: application/json" -d "$payload")
+    url=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('importedUrl',''))" 2>/dev/null || echo "")
+    if [ -n "$url" ]; then
+        echo "    ✅ ${label}: ${GRAFANA_URL}${url}"
+        IMPORTED_DASHBOARDS="${IMPORTED_DASHBOARDS}
+   ${label}: ${GRAFANA_URL}${url}"
+    else
+        echo "    ⚠️  ${label}: import failed. Response: ${result}"
+    fi
+}
+
+echo "==> Importing custom dashboards from ${SCRIPT_DIR}"
+IMPORTED_DASHBOARDS=""
+import_dashboard "cAdvisor" "cadvisor dashboard.json" "cadvisor*.json"
+import_dashboard "Node Exporter Full" "Node Exporter Full.json" "node*exporter*full*.json"
+
 echo "==> Waiting for Grafana to come back up..."
 for i in $(seq 1 20); do
     if curl -sf "${GRAFANA_URL}/api/health" > /dev/null 2>&1; then
@@ -595,6 +684,9 @@ echo " nvidia_gpu_exp:  (skipped — no GPU detected)"
 fi
 echo " Datasource UID: ${DS_UID}"
 echo " Dashboard:       ${GRAFANA_URL}${DASH_URL:-/dashboards (check UI)}"
+if [ -n "$IMPORTED_DASHBOARDS" ]; then
+echo " Imported dashboards:${IMPORTED_DASHBOARDS}"
+fi
 echo ""
 echo " Services:   systemctl status grafana-server prometheus prometheus-node-exporter"
 echo " Containers: docker ps --filter name=cadvisor"
