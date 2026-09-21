@@ -159,7 +159,8 @@ ExecStart=
 ExecStart=/usr/bin/nvidia_gpu_exporter --web.listen-address=:${NVIDIA_EXPORTER_PORT}
 EOF
         sudo systemctl daemon-reload
-        sudo systemctl enable --now nvidia_gpu_exporter
+        sudo systemctl enable nvidia_gpu_exporter
+        sudo systemctl restart nvidia_gpu_exporter   # restart so the port override applies even if already running
         GPU_EXPORTER_INSTALLED=1
     else
         echo "    ⚠️  Could not download nvidia_gpu_exporter — skipping GPU metrics"
