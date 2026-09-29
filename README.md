@@ -302,8 +302,28 @@ To restart the system:
 ```bash
 sudo reboot
 ```
+### 10. Teasting 
+It picks up CPU/RAM/Disk/GPU by title, whatever their UIDs are, so it works even after the UIDs change again. Change T=10 back to T=80 to restore.
 
-### 10. General Linux commands
+```bash
+AUTH='admin:root@1234'; API=http://localhost:3001; T=10
+curl -s -u "$AUTH" $API/api/v1/provisioning/alert-rules | T=$T python3 -c "
+import json,sys,os
+rules=json.load(sys.stdin)
+t=float(os.environ['T'])
+targets=[r for r in rules if r['title'].startswith('High ') and r['title'].endswith(' Usage Alert')]
+for r in targets:
+    r['data'][2]['model']['conditions'][0]['evaluator']['params']=[t]
+    print(json.dumps(r))
+" > /tmp/payloads.jsonl
+while IFS= read -r line; do
+  uid=$(echo "$line" | python3 -c "import json,sys; print(json.load(sys.stdin)['uid'])")
+  code=$(echo "$line" | curl -s -o /dev/null -w '%{http_code}' -X PUT -u "$AUTH" -H 'Content-Type: application/json' -H 'X-Disable-Provenance: true' -d @- $API/api/v1/provisioning/alert-rules/$uid)
+  echo "$uid -> $code"
+done < /tmp/payloads.jsonl
+```
+
+### 11. General Linux commands
 
 | Command | Description |
 | --- | --- |
